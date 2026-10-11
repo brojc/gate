@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 import requests
+import socket
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -95,6 +96,9 @@ EDGE_HOSTS = [
 OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port=443")
 
 NODES_URL = os.environ.get("NODES_URL", "https://brojc.github.io/gate/nodes.txt")
+
+# 当检测 Worker 端点整体不可达时，是否坚持硬失败（默认 False = 降级为 TCP 探测并继续部署）
+WORKER_STRICT = os.environ.get("WORKER_STRICT", "").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -322,6 +326,18 @@ def classify_network(host, exit_org, is_datacenter=None):
     if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
     return "unknown"
 
+def tcp_check(host, port, timeout=8):
+    """降级探测：直连 TCP 端口，判断主机:端口是否可连通。
+
+    注意：TCP 可达 ≠ SSTP 握手成功，仅在检测 Worker 不可达时作为可用性兜底。
+    """
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True, None
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def check_one(node, session):
     url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
     out = dict(node)
@@ -331,42 +347,67 @@ def check_one(node, session):
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
     out["residential"] = "unknown"
+    out["check_method"] = "worker"
+    out["worker_unreachable"] = False
+    worker_ok = False
     try:
         r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
-            return out
-        j = r.json()
-        ok = bool(j.get("success"))
-        out["success"] = ok
-        out["status"] = "success" if ok else "failed"
-        out["latency_ms"] = j.get("responseTime")
-        out["colo"] = j.get("colo")
-        out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-        exit_info = j.get("exit") or {}
-        if exit_info:
-            asn = exit_info.get("asn") or {}
-            org = asn.get("org") or asn.get("name") or ""
-            out["exit"] = {
-                "ip": exit_info.get("ip"),
-                "country": exit_info.get("country"),
-                "country_code": exit_info.get("country_code"),
-                "city": exit_info.get("city"),
-                "continent": exit_info.get("continent"),
-                "asn": asn.get("asn"),
-                "org": org,
-                "type": asn.get("type"),
-                "is_datacenter": exit_info.get("is_datacenter"),
-            }
-            out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
+            out["worker_unreachable"] = True
         else:
-            out["residential"] = classify_network(out["host"], None, None)
-        return out
+            try:
+                j = r.json()
+            except (ValueError, json.JSONDecodeError):
+                # Worker 端点未返回合法 JSON —— 常见于 Worker 未部署/路由未绑定（回源 nginx 默认页等）
+                snippet = " ".join(r.text.split())[:200]
+                out["error"] = f"Worker 返回非 JSON（疑似端点故障，已降级）: {snippet!r}"
+                out["worker_error"] = True
+                out["worker_unreachable"] = True
+            else:
+                worker_ok = True
+                ok = bool(j.get("success"))
+                out["success"] = ok
+                out["status"] = "success" if ok else "failed"
+                out["latency_ms"] = j.get("responseTime")
+                out["colo"] = j.get("colo")
+                out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
+                exit_info = j.get("exit") or {}
+                if exit_info:
+                    asn = exit_info.get("asn") or {}
+                    org = asn.get("org") or asn.get("name") or ""
+                    out["exit"] = {
+                        "ip": exit_info.get("ip"),
+                        "country": exit_info.get("country"),
+                        "country_code": exit_info.get("country_code"),
+                        "city": exit_info.get("city"),
+                        "continent": exit_info.get("continent"),
+                        "asn": asn.get("asn"),
+                        "org": org,
+                        "type": asn.get("type"),
+                        "is_datacenter": exit_info.get("is_datacenter"),
+                    }
+                    out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
+                else:
+                    out["residential"] = classify_network(out["host"], None, None)
+                return out
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["worker_error"] = True
-        return out
+        out["worker_unreachable"] = True
+
+    # ---- 降级：检测 Worker 不可达时，退化为直连 TCP 连通性探测 ----
+    if not worker_ok:
+        ok, terr = tcp_check(node["host"], node["port"])
+        if ok:
+            out["success"] = True
+            out["status"] = "success"
+            out["check_method"] = "tcp-fallback"
+            out["worker_error"] = False
+            out["note"] = "检测 Worker 不可达，已降级为 TCP 连通性探测（未验证 SSTP 握手）"
+            out["error"] = None
+    return out
 
 def check_all(nodes, session):
     results = []
@@ -495,15 +536,21 @@ def main():
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
     worker_errors = [r for r in failed if r.get("worker_error")]
+    worker_down = bool(results) and all(r.get("worker_unreachable") for r in results)
 
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
-    if uniq and not success and len(worker_errors) == len(uniq):
-        die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
+    if worker_down:
+        log("CLOUDFLARE WORKER", "⚠️ 检测 Worker 端点异常（未返回合法 JSON），已全部降级为 TCP 连通性探测")
+        if WORKER_STRICT:
+            die("Worker 全部请求异常且已启用严格模式, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
     data = build_outputs(results, raw_count, sstp_count, source)
+    data["worker_status"] = "degraded-tcp" if worker_down else "ok"
+    if worker_down:
+        data["worker_note"] = "检测 Worker 端点异常，本批节点为 TCP 连通性降级结果（未验证 SSTP 握手），请尽快恢复 CHECK_WORKER。"
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
